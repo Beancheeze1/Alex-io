@@ -1,5 +1,68 @@
 import express from "express";
 import morgan from "morgan";
+// --- top of file ---
+const processedEventIds = new Set();
+const commentedThreads = new Set();
+function remember(set, key, ms) { set.add(key); setTimeout(() => set.delete(key), ms).unref?.(); }
+
+// Fetch latest message on a thread
+async function getLatestMessage(threadId) {
+  const url = `https://api.hubapi.com/conversations/v3/conversations/threads/${threadId}/messages?limit=1&sort=-createdAt`;
+  const resp = await fetch(url, { headers: { Authorization: `Bearer ${process.env.HUBSPOT_TOKEN}` } });
+  if (!resp.ok) throw new Error(`Get messages ${resp.status}: ${await resp.text()}`);
+  const data = await resp.json();
+  const items = Array.isArray(data?.results) ? data.results : (Array.isArray(data) ? data : []);
+  return items[0] || null;
+}
+async function handleHubSpotEvent(ev) {
+  const sub = (ev.subscriptionType || "").toLowerCase();
+  const eventId = ev.eventId || `${sub}:${ev.objectId}:${ev.occurredAt}`;
+  const threadId = ev.objectId;
+
+  // Deduplicate retries (5 min TTL)
+  if (processedEventIds.has(eventId)) return;
+  remember(processedEventIds, eventId, 5 * 60 * 1000);
+
+  // Only act on thread creation (avoid loops on later messages)
+  if (sub !== "conversation.creation") return;
+  if (!threadId) return;
+
+  // Comment once per thread (1 hour TTL)
+  if (commentedThreads.has(threadId)) return;
+  remember(commentedThreads, threadId, 60 * 60 * 1000);
+
+  // Ignore our own posts (and any outgoing system content)
+  try {
+    const msg = await getLatestMessage(threadId);
+    if (msg) {
+      const type = (msg.type || "").toUpperCase();      // "MESSAGE" or "COMMENT"
+      const dir  = (msg.direction || "").toUpperCase(); // "INCOMING" or "OUTGOING"
+      const appId = msg.client?.integrationAppId;       // numeric app id if from an app
+
+      if (type === "COMMENT" || dir === "OUTGOING" || (appId && String(appId) === process.env.HUBSPOT_APP_ID)) {
+        return; // do nothing if latest was ours/outgoing
+      }
+    }
+  } catch (e) {
+    console.warn("Latest-message check failed:", e.message);
+  }
+
+  // Post ONE comment (proof step only)
+  if (process.env.AUTO_COMMENT === "true" && process.env.HUBSPOT_TOKEN) {
+    await postThreadComment(threadId, "✅ Webhook OK — bot received the message.");
+  }
+}
+
+
+  } catch (e) {
+    console.warn("Latest-message check failed (continuing cautiously):", e.message);
+  }
+
+  // 5) Finally, post ONE comment (if you still want this proof behavior)
+  if (process.env.AUTO_COMMENT === "true" && process.env.HUBSPOT_TOKEN) {
+    await postThreadComment(threadId, "✅ Webhook OK — bot received the message.");
+  }
+}
 
 const app = express();
 app.use(morgan("tiny"));
