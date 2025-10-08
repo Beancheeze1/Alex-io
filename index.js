@@ -1,6 +1,18 @@
 import express from "express";
 import morgan from "morgan";
 
+// after parsing events in POST /hubspot/webhook
+console.log("Events:", events.map(e => ({
+  sub: e.subscriptionType, obj: e.objectId, when: e.occurredAt, id: e.eventId
+})));
+
+// at the top of handleHubSpotEvent
+console.log("HANDLE", { sub, threadId, eventId,
+  AUTO_COMMENT: process.env.AUTO_COMMENT, AUTO_REPLY: process.env.AUTO_REPLY });
+
+// before posting comment/message
+console.log("ACTION", { type: "COMMENT or MESSAGE", threadId });
+
 /**
  * HubSpot Conversations webhook server (Node + Express)
  * Features:
