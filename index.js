@@ -1,27 +1,8 @@
 import express from "express";
 import morgan from "morgan";
 
-/**
- * HubSpot Conversations webhook server (Node + Express)
- * Improvements in this version:
- *  - Handles event ordering/race conditions by briefly waiting, then scanning
- *    the last 10 messages for the newest inbound MESSAGE from the customer.
- *  - Extra diagnostics to print message types/directions it saw.
- *  - Keeps loop guards (dedupe, TTL, ignore self/outgoing).
- *
- * Env vars (Render → Service → Environment):
- *   HUBSPOT_TOKEN=pat-xxxx
- *   AUTO_COMMENT=false|true
- *   AUTO_REPLY=false|true
- *   HUBSPOT_APP_ID=123456   # optional: helps ignore your own posts
- *   REPLY_TTL_HOURS=12
- *   PORT=3000
- */
-
 const app = express();
 app.use(morgan("tiny"));
-
-// Capture raw body for signature verification later; parse JSON manually
 app.use("/hubspot/webhook", express.raw({ type: "*/*" }));
 
 app.get("/healthz", (_req, res) => res.status(200).send("ok"));
@@ -61,13 +42,21 @@ async function postThreadComment(threadId, text) {
   return resp.json().catch(() => ({}));
 }
 
-async function sendThreadMessage(threadId, { text, subject, toEmail }) {
+async function sendThreadMessage(threadId, { text, subject, toEmail, senderActorId, channelId, channelAccountId }) {
   const url = `https://api.hubapi.com/conversations/v3/conversations/threads/${threadId}/messages`;
   const body = {
     type: "MESSAGE",
     text,
     subject,
-    recipients: toEmail ? [{ deliveryIdentifiers: [{ type: "TO", value: toEmail }] }] : undefined,
+    senderActorId,     // REQUIRED by API
+    channelId,         // REQUIRED by API
+    channelAccountId,  // REQUIRED by API
+    recipients: toEmail
+      ? [{
+          recipientField: "TO",
+          deliveryIdentifier: { type: "HS_EMAIL_ADDRESS", value: toEmail }
+        }]
+      : [],
   };
   const resp = await hubspotFetch(url, { method: "POST", body: JSON.stringify(body) });
   if (!resp.ok) throw new Error(`POST message ${resp.status}: ${await resp.text().catch(() => "")}`);
@@ -98,15 +87,27 @@ function findLatestInboundEmail(messages) {
     const type = (m.type || "").toUpperCase();        // "MESSAGE" or "COMMENT"
     const dir  = (m.direction || "").toUpperCase();   // "INCOMING" or "OUTGOING"
     const appId = m.client?.integrationAppId;
-    if (type !== "MESSAGE") continue;                 // ignore comments/system
-    if (dir === "OUTGOING") continue;                 // ignore our responses
-    if (appId && myAppId && String(appId) === myAppId) continue; // ignore our own
-    return m; // this is the newest inbound email from the customer
+    if (type !== "MESSAGE") continue;
+    if (dir === "OUTGOING") continue;
+    if (appId && myAppId && String(appId) === myAppId) continue;
+    return m;
   }
   return null;
 }
 
-// ===== Webhook route =====
+function findLatestAgentActorId(messages) {
+  // Look for latest OUTGOING MESSAGE and grab its sender actorId (A-###)
+  for (const m of messages) {
+    const type = (m.type || "").toUpperCase();
+    const dir  = (m.direction || "").toUpperCase();
+    if (type === "MESSAGE" && dir === "OUTGOING" && Array.isArray(m.senders) && m.senders[0]?.actorId) {
+      const a = m.senders[0].actorId;
+      if (typeof a === "string" && a.startsWith("A-")) return a;
+    }
+  }
+  return null;
+}
+
 app.post("/hubspot/webhook", async (req, res) => {
   try {
     const bodyText = req.body?.toString("utf8") || "[]";
@@ -133,18 +134,17 @@ app.post("/hubspot/webhook", async (req, res) => {
   }
 });
 
-// ===== Event handler with loop guards and race handling =====
 async function handleHubSpotEvent(ev) {
   const sub = (ev.subscriptionType || "").toLowerCase();
   const threadId = ev.objectId;
   const eventId = ev.eventId || `${sub}:${threadId}:${ev.occurredAt}`;
   console.log("HANDLE", { sub, threadId, eventId, AUTO_COMMENT: process.env.AUTO_COMMENT, AUTO_REPLY: process.env.AUTO_REPLY });
 
-  // 1) De-dupe HubSpot retries (5 min TTL)
+  // De-dupe (5m)
   if (processedEventIds.has(eventId)) return;
   remember(processedEventIds, eventId, 5 * 60 * 1000);
 
-  // 2) Optional: proof comment once on creation
+  // Proof comment on creation (optional)
   if (sub === "conversation.creation") {
     if (!threadId || commentedThreads.has(threadId)) return;
     remember(commentedThreads, threadId, 60 * 60 * 1000);
@@ -160,11 +160,10 @@ async function handleHubSpotEvent(ev) {
     return;
   }
 
-  // 3) Auto-reply only on NEW inbound messages
+  // Auto-reply on NEW inbound message
   if (sub !== "conversation.newmessage" || !threadId) return;
   if (process.env.AUTO_REPLY !== "true") return;
 
-  // Race handling: tiny wait to let the inbound message persist, then fetch last 10
   await sleep(350);
   let messages = [];
   try {
@@ -174,12 +173,14 @@ async function handleHubSpotEvent(ev) {
     return;
   }
 
-  // Log what we saw (types/directions) to aid debugging
   console.log("RECENTS", messages.map(m => ({
     id: m.id || m.messageId,
     t: m.type,
     d: m.direction,
-    app: m.client?.integrationAppId
+    app: m.client?.integrationAppId,
+    ch: m.channelId,
+    acc: m.channelAccountId,
+    senders: (Array.isArray(m.senders) && m.senders.map(s => s.actorId)) || []
   })));
 
   const inbound = findLatestInboundEmail(messages);
@@ -188,7 +189,26 @@ async function handleHubSpotEvent(ev) {
     return;
   }
 
-  // TTL: don't reply repeatedly to same thread
+  // Required fields per API
+  const channelId = inbound.channelId || messages.find(m => m.channelId)?.channelId;
+  const channelAccountId = inbound.channelAccountId || messages.find(m => m.channelAccountId)?.channelAccountId;
+
+  let senderActorId = process.env.SENDER_ACTOR_ID;
+  if (!senderActorId) {
+    senderActorId = findLatestAgentActorId(messages);
+    if (senderActorId) {
+      console.log("Derived senderActorId from previous OUTGOING:", senderActorId);
+    }
+  }
+
+  if (!channelId || !channelAccountId || !senderActorId) {
+    console.error("Missing required fields to send:", { channelId, channelAccountId, senderActorId });
+    try {
+      await postThreadComment(threadId, "⚠️ Bot is connected but needs configuration: missing channelId/channelAccountId or SENDER_ACTOR_ID. See server logs for details.");
+    } catch {}
+    return;
+  }
+
   const ttlHours = Number(process.env.REPLY_TTL_HOURS || 12);
   if (repliedThreads.has(threadId)) return;
   remember(repliedThreads, threadId, Math.max(1, ttlHours) * 60 * 60 * 1000);
@@ -205,8 +225,8 @@ async function handleHubSpotEvent(ev) {
   const toEmail = extractSenderEmail(inbound);
 
   try {
-    console.log("ACTION", { type: "MESSAGE", threadId, toEmail });
-    await sendThreadMessage(threadId, { text, subject, toEmail });
+    console.log("ACTION", { type: "MESSAGE", threadId, toEmail, senderActorId, channelId, channelAccountId });
+    await sendThreadMessage(threadId, { text, subject, toEmail, senderActorId, channelId, channelAccountId });
     console.log("Auto-reply sent to thread", threadId, "to", toEmail || "(thread recipients)");
   } catch (e) {
     console.error("Failed to send auto-reply:", e);
