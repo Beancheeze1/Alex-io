@@ -222,6 +222,7 @@ async function handleHubSpotEvent(ev) {
     `If you’d prefer not to hear from us, reply “unsubscribe.”`
   ].join("\n");
   const subject = "Re: your message";
+  console.log("INBOUND", JSON.stringify(inbound, null, 2));
   const toEmail = extractSenderEmail(inbound);
 
   try {
