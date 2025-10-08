@@ -3,22 +3,18 @@ import morgan from "morgan";
 
 /**
  * HubSpot Conversations webhook server (Node + Express)
- * - ACKs fast (200) to avoid retries/timeouts
- * - De-dupes retries by eventId (5 min TTL)
- * - Optional proof COMMENT once on conversation.creation (AUTO_COMMENT)
- * - Real MESSAGE reply once per thread on inbound conversation.newMessage (AUTO_REPLY)
- * - Ignores own/outgoing content using latest message check
- * - Clear logs placed in the right spots (no undefined vars)
+ * Improvements in this version:
+ *  - Handles event ordering/race conditions by briefly waiting, then scanning
+ *    the last 10 messages for the newest inbound MESSAGE from the customer.
+ *  - Extra diagnostics to print message types/directions it saw.
+ *  - Keeps loop guards (dedupe, TTL, ignore self/outgoing).
  *
  * Env vars (Render → Service → Environment):
- *   HUBSPOT_TOKEN=pat-xxxx            # Private App token (required to write back)
- *   AUTO_COMMENT=false|true           # proof step only; default false
- *   AUTO_REPLY=false|true             # set true to send real replies
- *   HUBSPOT_APP_ID=123456             # (optional) your app's numeric id to ignore self
- *   REPLY_TTL_HOURS=12                # don't auto-reply to same thread again within N hours
- *   VERIFY_SIGNATURE=false            # (later) enforce X-HubSpot-Signature v3
- *   HUBSPOT_APP_SECRET=...            # used when VERIFY_SIGNATURE=true
- *   CALENDLY_URL=https://calendly.com/yourlink   # optional for CTA
+ *   HUBSPOT_TOKEN=pat-xxxx
+ *   AUTO_COMMENT=false|true
+ *   AUTO_REPLY=false|true
+ *   HUBSPOT_APP_ID=123456   # optional: helps ignore your own posts
+ *   REPLY_TTL_HOURS=12
  *   PORT=3000
  */
 
@@ -30,11 +26,13 @@ app.use("/hubspot/webhook", express.raw({ type: "*/*" }));
 
 app.get("/healthz", (_req, res) => res.status(200).send("ok"));
 
-// ===== In-memory state with TTL =====
-const processedEventIds = new Set(); // for deduping retries
-const commentedThreads = new Set();  // proof-comment once per thread
-const repliedThreads = new Set();    // avoid multiple auto-replies per thread
+// ===== Utilities =====
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// ===== In-memory state with TTL =====
+const processedEventIds = new Set();
+const commentedThreads = new Set();
+const repliedThreads = new Set();
 function remember(set, key, ms) {
   set.add(key);
   const t = setTimeout(() => set.delete(key), ms);
@@ -42,76 +40,47 @@ function remember(set, key, ms) {
 }
 
 // ===== HubSpot API helpers =====
-async function postThreadComment(threadId, text) {
+async function hubspotFetch(url, init) {
   const token = process.env.HUBSPOT_TOKEN;
   if (!token) throw new Error("HUBSPOT_TOKEN not set");
-
-  const url = `https://api.hubapi.com/conversations/v3/conversations/threads/${threadId}/messages`;
-  const body = { type: "COMMENT", text };
-
   const resp = await fetch(url, {
-    method: "POST",
+    ...(init || {}),
     headers: {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
+      ...(init?.headers || {}),
     },
-    body: JSON.stringify(body),
   });
+  return resp;
+}
 
-  if (!resp.ok) {
-    const txt = await resp.text().catch(() => "");
-    throw new Error(`HubSpot POST comment ${resp.status}: ${txt}`);
-  }
+async function postThreadComment(threadId, text) {
+  const url = `https://api.hubapi.com/conversations/v3/conversations/threads/${threadId}/messages`;
+  const resp = await hubspotFetch(url, { method: "POST", body: JSON.stringify({ type: "COMMENT", text }) });
+  if (!resp.ok) throw new Error(`POST comment ${resp.status}: ${await resp.text().catch(() => "")}`);
   return resp.json().catch(() => ({}));
 }
 
 async function sendThreadMessage(threadId, { text, subject, toEmail }) {
-  const token = process.env.HUBSPOT_TOKEN;
-  if (!token) throw new Error("HUBSPOT_TOKEN not set");
-
   const url = `https://api.hubapi.com/conversations/v3/conversations/threads/${threadId}/messages`;
   const body = {
     type: "MESSAGE",
     text,
     subject,
-    recipients: toEmail
-      ? [{ deliveryIdentifiers: [{ type: "TO", value: toEmail }] }]
-      : undefined,
+    recipients: toEmail ? [{ deliveryIdentifiers: [{ type: "TO", value: toEmail }] }] : undefined,
   };
-
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!resp.ok) {
-    const txt = await resp.text().catch(() => "");
-    throw new Error(`HubSpot POST message ${resp.status}: ${txt}`);
-  }
+  const resp = await hubspotFetch(url, { method: "POST", body: JSON.stringify(body) });
+  if (!resp.ok) throw new Error(`POST message ${resp.status}: ${await resp.text().catch(() => "")}`);
   return resp.json().catch(() => ({}));
 }
 
-async function getLatestMessage(threadId) {
-  const token = process.env.HUBSPOT_TOKEN;
-  if (!token) throw new Error("HUBSPOT_TOKEN not set");
-
-  const url = `https://api.hubapi.com/conversations/v3/conversations/threads/${threadId}/messages?limit=1&sort=-createdAt`;
-  const resp = await fetch(url, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-
-  if (!resp.ok) {
-    const txt = await resp.text().catch(() => "");
-    throw new Error(`HubSpot GET messages ${resp.status}: ${txt}`);
-  }
-
+async function getRecentMessages(threadId, limit = 10) {
+  const url = `https://api.hubapi.com/conversations/v3/conversations/threads/${threadId}/messages?limit=${limit}&sort=-createdAt`;
+  const resp = await hubspotFetch(url, { method: "GET", headers: {} });
+  if (!resp.ok) throw new Error(`GET messages ${resp.status}: ${await resp.text().catch(() => "")}`);
   const data = await resp.json().catch(() => ({}));
   const items = Array.isArray(data?.results) ? data.results : (Array.isArray(data) ? data : []);
-  return items[0] || null;
+  return items;
 }
 
 function extractSenderEmail(msg) {
@@ -123,14 +92,25 @@ function extractSenderEmail(msg) {
   );
 }
 
+function findLatestInboundEmail(messages) {
+  const myAppId = process.env.HUBSPOT_APP_ID && String(process.env.HUBSPOT_APP_ID);
+  for (const m of messages) {
+    const type = (m.type || "").toUpperCase();        // "MESSAGE" or "COMMENT"
+    const dir  = (m.direction || "").toUpperCase();   // "INCOMING" or "OUTGOING"
+    const appId = m.client?.integrationAppId;
+    if (type !== "MESSAGE") continue;                 // ignore comments/system
+    if (dir === "OUTGOING") continue;                 // ignore our responses
+    if (appId && myAppId && String(appId) === myAppId) continue; // ignore our own
+    return m; // this is the newest inbound email from the customer
+  }
+  return null;
+}
+
 // ===== Webhook route =====
 app.post("/hubspot/webhook", async (req, res) => {
   try {
-    // TODO: add X-HubSpot-Signature v3 verification when VERIFY_SIGNATURE === "true"
-
     const bodyText = req.body?.toString("utf8") || "[]";
-    // ACK fast (after reading body so it's available for parsing)
-    res.sendStatus(200);
+    res.sendStatus(200); // ACK fast
 
     let events = [];
     try {
@@ -141,12 +121,8 @@ app.post("/hubspot/webhook", async (req, res) => {
       return;
     }
 
-    // Properly scoped log (events is defined here)
     console.log("Events:", events.map(e => ({
-      sub: e.subscriptionType,
-      obj: e.objectId,
-      id: e.eventId,
-      when: e.occurredAt
+      sub: e.subscriptionType, obj: e.objectId, id: e.eventId, when: e.occurredAt
     })));
 
     for (const ev of events) {
@@ -157,34 +133,21 @@ app.post("/hubspot/webhook", async (req, res) => {
   }
 });
 
-// ===== Event handler with loop guards =====
+// ===== Event handler with loop guards and race handling =====
 async function handleHubSpotEvent(ev) {
   const sub = (ev.subscriptionType || "").toLowerCase();
   const threadId = ev.objectId;
   const eventId = ev.eventId || `${sub}:${threadId}:${ev.occurredAt}`;
+  console.log("HANDLE", { sub, threadId, eventId, AUTO_COMMENT: process.env.AUTO_COMMENT, AUTO_REPLY: process.env.AUTO_REPLY });
 
-  console.log("HANDLE", {
-    sub, threadId, eventId,
-    AUTO_COMMENT: process.env.AUTO_COMMENT,
-    AUTO_REPLY: process.env.AUTO_REPLY
-  });
-
-  // 1) De-dupe HubSpot retries for 5 minutes
+  // 1) De-dupe HubSpot retries (5 min TTL)
   if (processedEventIds.has(eventId)) return;
   remember(processedEventIds, eventId, 5 * 60 * 1000);
 
-  // 2) Optional: proof comment on thread creation (once)
+  // 2) Optional: proof comment once on creation
   if (sub === "conversation.creation") {
     if (!threadId || commentedThreads.has(threadId)) return;
     remember(commentedThreads, threadId, 60 * 60 * 1000);
-
-    const latest = await getLatestMessage(threadId).catch(() => null);
-    const type = (latest?.type || "").toUpperCase();
-    const dir  = (latest?.direction || "").toUpperCase();
-    const appId = latest?.client?.integrationAppId;
-    const myAppId = process.env.HUBSPOT_APP_ID && String(process.env.HUBSPOT_APP_ID);
-    if (type === "COMMENT" || dir === "OUTGOING" || (appId && myAppId && String(appId) === myAppId)) return;
-
     if (process.env.AUTO_COMMENT === "true") {
       try {
         console.log("ACTION", { type: "COMMENT", threadId });
@@ -197,30 +160,39 @@ async function handleHubSpotEvent(ev) {
     return;
   }
 
-  // 3) Real replies only on NEW inbound messages
-  if (sub !== "conversation.newMessage" || !threadId) return;
+  // 3) Auto-reply only on NEW inbound messages
+  if (sub !== "conversation.newmessage" || !threadId) return;
+  if (process.env.AUTO_REPLY !== "true") return;
 
-  const latest = await getLatestMessage(threadId).catch(() => null);
-  if (!latest) return;
+  // Race handling: tiny wait to let the inbound message persist, then fetch last 10
+  await sleep(350);
+  let messages = [];
+  try {
+    messages = await getRecentMessages(threadId, 10);
+  } catch (e) {
+    console.error("Failed to fetch messages:", e);
+    return;
+  }
 
-  const type = (latest.type || "").toUpperCase();      // "MESSAGE" or "COMMENT"
-  const dir  = (latest.direction || "").toUpperCase(); // "INCOMING" or "OUTGOING"
-  const appId = latest.client?.integrationAppId;
-  const myAppId = process.env.HUBSPOT_APP_ID && String(process.env.HUBSPOT_APP_ID);
+  // Log what we saw (types/directions) to aid debugging
+  console.log("RECENTS", messages.map(m => ({
+    id: m.id || m.messageId,
+    t: m.type,
+    d: m.direction,
+    app: m.client?.integrationAppId
+  })));
 
-  // Ignore anything that isn't a customer's inbound email
-  if (type !== "MESSAGE" || dir !== "INCOMING") return;
-  if (appId && myAppId && String(appId) === myAppId) return; // ignore our own posts
+  const inbound = findLatestInboundEmail(messages);
+  if (!inbound) {
+    console.log("No inbound MESSAGE found to reply to (skipping).");
+    return;
+  }
 
-  // Respect TTL (don't auto-reply to same thread repeatedly)
+  // TTL: don't reply repeatedly to same thread
   const ttlHours = Number(process.env.REPLY_TTL_HOURS || 12);
   if (repliedThreads.has(threadId)) return;
   remember(repliedThreads, threadId, Math.max(1, ttlHours) * 60 * 60 * 1000);
 
-  // Only auto-reply when explicitly enabled
-  if (process.env.AUTO_REPLY !== "true") return;
-
-  // TODO: Replace with classifier + KB retrieval
   const calendly = process.env.CALENDLY_URL || "<YOUR-CALENDLY-LINK>";
   const text = [
     `Thanks for reaching out — happy to help!`,
@@ -230,10 +202,10 @@ async function handleHubSpotEvent(ev) {
     `If you’d prefer not to hear from us, reply “unsubscribe.”`
   ].join("\n");
   const subject = "Re: your message";
+  const toEmail = extractSenderEmail(inbound);
 
-  const toEmail = extractSenderEmail(latest);
   try {
-    console.log("ACTION", { type: "MESSAGE", threadId, toEmail, AUTO_REPLY: process.env.AUTO_REPLY });
+    console.log("ACTION", { type: "MESSAGE", threadId, toEmail });
     await sendThreadMessage(threadId, { text, subject, toEmail });
     console.log("Auto-reply sent to thread", threadId, "to", toEmail || "(thread recipients)");
   } catch (e) {
