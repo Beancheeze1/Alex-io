@@ -1,26 +1,14 @@
 import express from "express";
 import morgan from "morgan";
 
-// after parsing events in POST /hubspot/webhook
-console.log("Events:", events.map(e => ({
-  sub: e.subscriptionType, obj: e.objectId, when: e.occurredAt, id: e.eventId
-})));
-
-// at the top of handleHubSpotEvent
-console.log("HANDLE", { sub, threadId, eventId,
-  AUTO_COMMENT: process.env.AUTO_COMMENT, AUTO_REPLY: process.env.AUTO_REPLY });
-
-// before posting comment/message
-console.log("ACTION", { type: "COMMENT or MESSAGE", threadId });
-
 /**
  * HubSpot Conversations webhook server (Node + Express)
- * Features:
- *  - ACKs fast (200) to avoid timeouts
- *  - De-dupes retries by eventId (5 min TTL)
- *  - Optional proof COMMENT once on conversation.creation (AUTO_COMMENT)
- *  - Real MESSAGE reply once per thread on inbound conversation.newMessage (AUTO_REPLY)
- *  - Ignores own/outgoing content using latest message check
+ * - ACKs fast (200) to avoid retries/timeouts
+ * - De-dupes retries by eventId (5 min TTL)
+ * - Optional proof COMMENT once on conversation.creation (AUTO_COMMENT)
+ * - Real MESSAGE reply once per thread on inbound conversation.newMessage (AUTO_REPLY)
+ * - Ignores own/outgoing content using latest message check
+ * - Clear logs placed in the right spots (no undefined vars)
  *
  * Env vars (Render → Service → Environment):
  *   HUBSPOT_TOKEN=pat-xxxx            # Private App token (required to write back)
@@ -139,9 +127,11 @@ function extractSenderEmail(msg) {
 app.post("/hubspot/webhook", async (req, res) => {
   try {
     // TODO: add X-HubSpot-Signature v3 verification when VERIFY_SIGNATURE === "true"
-    res.sendStatus(200); // ACK fast
 
     const bodyText = req.body?.toString("utf8") || "[]";
+    // ACK fast (after reading body so it's available for parsing)
+    res.sendStatus(200);
+
     let events = [];
     try {
       const parsed = JSON.parse(bodyText);
@@ -150,6 +140,14 @@ app.post("/hubspot/webhook", async (req, res) => {
       console.error("JSON parse error:", e);
       return;
     }
+
+    // Properly scoped log (events is defined here)
+    console.log("Events:", events.map(e => ({
+      sub: e.subscriptionType,
+      obj: e.objectId,
+      id: e.eventId,
+      when: e.occurredAt
+    })));
 
     for (const ev of events) {
       await handleHubSpotEvent(ev);
@@ -164,6 +162,12 @@ async function handleHubSpotEvent(ev) {
   const sub = (ev.subscriptionType || "").toLowerCase();
   const threadId = ev.objectId;
   const eventId = ev.eventId || `${sub}:${threadId}:${ev.occurredAt}`;
+
+  console.log("HANDLE", {
+    sub, threadId, eventId,
+    AUTO_COMMENT: process.env.AUTO_COMMENT,
+    AUTO_REPLY: process.env.AUTO_REPLY
+  });
 
   // 1) De-dupe HubSpot retries for 5 minutes
   if (processedEventIds.has(eventId)) return;
@@ -183,6 +187,7 @@ async function handleHubSpotEvent(ev) {
 
     if (process.env.AUTO_COMMENT === "true") {
       try {
+        console.log("ACTION", { type: "COMMENT", threadId });
         await postThreadComment(threadId, "✅ Webhook OK — bot received the message.");
         console.log("Comment posted on thread", threadId);
       } catch (e) {
@@ -228,6 +233,7 @@ async function handleHubSpotEvent(ev) {
 
   const toEmail = extractSenderEmail(latest);
   try {
+    console.log("ACTION", { type: "MESSAGE", threadId, toEmail, AUTO_REPLY: process.env.AUTO_REPLY });
     await sendThreadMessage(threadId, { text, subject, toEmail });
     console.log("Auto-reply sent to thread", threadId, "to", toEmail || "(thread recipients)");
   } catch (e) {
