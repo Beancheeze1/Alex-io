@@ -10,6 +10,7 @@ app.get("/healthz", (_req, res) => res.status(200).send("ok"));
 // ===== Utilities =====
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
+const nowIso = () => new Date().toISOString();
 
 // ===== In-memory state with TTL =====
 const processedEventIds = new Set();
@@ -52,19 +53,18 @@ async function sendThreadMessage(threadId, { text, subject, toEmail, senderActor
     senderActorId,
     channelId,
     channelAccountId,
-    recipients: toEmail
-      ? [{
-          recipientField: "TO",
-          deliveryIdentifier: { type: "HS_EMAIL_ADDRESS", value: toEmail }
-        }]
-      : [],
+    recipients: [{
+      recipientField: "TO",
+      deliveryIdentifier:  { type: "HS_EMAIL_ADDRESS", value: toEmail },
+      deliveryIdentifiers: [{ type: "HS_EMAIL_ADDRESS", value: toEmail }]
+    }],
   };
   const resp = await hubspotFetch(url, { method: "POST", body: JSON.stringify(body) });
   if (!resp.ok) throw new Error(`POST message ${resp.status}: ${await resp.text().catch(() => "")}`);
   return resp.json().catch(() => ({}));
 }
 
-async function getRecentMessages(threadId, limit = 15) {
+async function getRecentMessages(threadId, limit = 20) {
   const url = `https://api.hubapi.com/conversations/v3/conversations/threads/${threadId}/messages?limit=${limit}&sort=-createdAt`;
   const resp = await hubspotFetch(url, { method: "GET", headers: {} });
   if (!resp.ok) throw new Error(`GET messages ${resp.status}: ${await resp.text().catch(() => "")}`);
@@ -78,15 +78,88 @@ async function getActor(actorId) {
   try {
     const url = `https://api.hubapi.com/conversations/v3/conversations/actors/${actorId}`;
     const resp = await hubspotFetch(url, { method: "GET", headers: {} });
+    if (!resp.ok) return null;
+    return await resp.json().catch(() => ({}));
+  } catch {
+    return null;
+  }
+}
+
+// ===== CRM helpers (contact tagging) =====
+async function findContactByEmail(email) {
+  try {
+    const url = `https://api.hubapi.com/crm/v3/objects/contacts/search`;
+    const body = {
+      filterGroups: [{
+        filters: [{ propertyName: "email", operator: "EQ", value: email }]
+      }],
+      properties: ["email"]
+    };
+    const resp = await hubspotFetch(url, { method: "POST", body: JSON.stringify(body) });
     if (!resp.ok) {
       const t = await resp.text().catch(() => "");
-      console.warn("Actor fetch failed", resp.status, t);
+      console.warn("Search contact failed", resp.status, t);
       return null;
     }
-    return await resp.json().catch(() => ({}));
+    const data = await resp.json().catch(() => ({}));
+    const first = data?.results?.[0];
+    return first?.id || null;
   } catch (e) {
-    console.warn("Actor fetch error", e.message);
+    console.warn("Search contact error", e?.message || e);
     return null;
+  }
+}
+
+async function createContact(email, props = {}) {
+  try {
+    const url = `https://api.hubapi.com/crm/v3/objects/contacts`;
+    const body = { properties: { email, ...props } };
+    const resp = await hubspotFetch(url, { method: "POST", body: JSON.stringify(body) });
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => "");
+      console.warn("Create contact failed", resp.status, t);
+      return null;
+    }
+    const data = await resp.json().catch(() => ({}));
+    return data?.id || null;
+  } catch (e) {
+    console.warn("Create contact error", e?.message || e);
+    return null;
+  }
+}
+
+async function updateContact(contactId, props) {
+  try {
+    const url = `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`;
+    const body = { properties: props };
+    const resp = await hubspotFetch(url, { method: "PATCH", body: JSON.stringify(body) });
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => "");
+      console.warn("Update contact failed", resp.status, t);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.warn("Update contact error", e?.message || e);
+    return false;
+  }
+}
+
+async function tagIntentOnContact(email, intent) {
+  if (!email || !EMAIL_RE.test(email)) return;
+  const propName = process.env.INTENT_PROPERTY || "bot_intent";
+  const timeProp = process.env.INTENT_TIME_PROPERTY || "bot_last_reply_at";
+  // 1) find or create contact
+  let id = await findContactByEmail(email);
+  if (!id) {
+    id = await createContact(email);
+    if (!id) return;
+  }
+  // 2) update properties
+  const ok = await updateContact(id, { [propName]: String(intent), [timeProp]: nowIso() });
+  if (!ok) {
+    // leave a breadcrumb comment if property is missing schema
+    console.warn(`Tagging failed — ensure contact properties "${propName}" (text) and "${timeProp}" (datetime) exist.`);
   }
 }
 
@@ -112,10 +185,8 @@ function pickEmailFromObject(obj) {
 function extractEmailFromSendersArray(senders) {
   if (!Array.isArray(senders)) return null;
   for (const s of senders) {
-    // object form
     const di = s?.deliveryIdentifier;
-    if (di && typeof di === "object") {
-      // either singular object or array-like
+    if (di) {
       if (Array.isArray(di)) {
         for (const x of di) {
           if (x?.type === "HS_EMAIL_ADDRESS" && x?.value) return x.value;
@@ -124,14 +195,12 @@ function extractEmailFromSendersArray(senders) {
         if (di?.type === "HS_EMAIL_ADDRESS" && di?.value) return di.value;
       }
     }
-    // alternate fields seen occasionally
     if (s?.email) return s.email;
     if (s?.address) return s.address;
   }
   return null;
 }
 
-// Robust extractor from an inbound message object
 async function extractSenderEmail(inbound) {
   // 1) Preferred: senders[].deliveryIdentifier.value
   const fromSenders = extractEmailFromSendersArray(inbound?.senders);
@@ -147,7 +216,7 @@ async function extractSenderEmail(inbound) {
   const headerGuess = pickEmailFromObject(inbound?.headers) || pickEmailFromObject(inbound?.emailHeaders);
   if (headerGuess) return headerGuess;
 
-  // 4) Last resort: fetch the actor (V-####) and scan
+  // 4) Last resort: fetch the actor (V-####) and scan for any email-like string
   const actorId = (inbound?.senders && inbound.senders[0]?.actorId) || inbound?.createdBy || null;
   if (actorId && /^V-\d+/.test(String(actorId))) {
     const actor = await getActor(actorId);
@@ -156,6 +225,87 @@ async function extractSenderEmail(inbound) {
   }
 
   return null;
+}
+
+// ===== Bounce/NDR guard =====
+const isBounce = (m) => {
+  const s = (m.subject || "").toLowerCase();
+  const n = (m.senders?.[0]?.name || "").toLowerCase();
+  return s.startsWith("undeliverable") ||
+         s.includes("delivery status notification") ||
+         n.includes("mail delivery subsystem") ||
+         n.includes("microsoft outlook");
+};
+
+// ===== Simple intent templates =====
+const TEMPLATES = {
+  pricing: (calendly) => [
+    "Thanks for reaching out! Here’s a quick overview of pricing:",
+    "• Starter: from $299/mo",
+    "• Growth: from $799/mo (includes HubSpot integration + rules)",
+    "• Scale: custom (SLA + advanced routing)",
+    "",
+    `Happy to tailor it — book a quick call: ${calendly}`,
+    "",
+    "If you’d prefer not to hear from us, reply “unsubscribe.”"
+  ].join("\n"),
+
+  demo: (calendly) => [
+    "Awesome — we’d love to show you a demo.",
+    `Grab a time here: ${calendly}`,
+    "",
+    "If you share your use case (inbox volume, team size, goals), we’ll tailor the walkthrough."
+  ].join("\n"),
+
+  support: () => [
+    "Thanks for reaching out to support!",
+    "Could you share the steps to reproduce, any error messages, and a screenshot?",
+    "We’ll take a look and get you unblocked."
+  ].join("\n"),
+
+  fallback: (calendly) => [
+    "Thanks for reaching out — happy to help!",
+    "Could you share a bit more detail (volume, timeline, and any specs)?",
+    `If convenient, you can also grab a quick call: ${calendly}`,
+    "",
+    "If you’d prefer not to hear from us, reply “unsubscribe.”"
+  ].join("\n"),
+};
+
+const KEYWORDS = {
+  pricing: ["price", "pricing", "cost", "quote", "rate", "rates"],
+  demo: ["demo", "walkthrough", "trial", "show", "meeting", "call", "book"],
+  support: ["error", "bug", "issue", "broken", "doesn't work", "help", "support"],
+  unsubscribe: ["unsubscribe", "opt out", "stop emailing", "remove me"]
+};
+
+function detectIntent(inbound) {
+  const txt = `${(inbound.subject||"")} ${inbound.text||""}`.toLowerCase();
+  for (const k of KEYWORDS.unsubscribe) if (txt.includes(k)) return "unsubscribe";
+  for (const k of KEYWORDS.pricing) if (txt.includes(k)) return "pricing";
+  for (const k of KEYWORDS.demo) if (txt.includes(k)) return "demo";
+  for (const k of KEYWORDS.support) if (txt.includes(k)) return "support";
+  return "fallback";
+}
+
+function makeReply(inbound, calendly) {
+  const intent = detectIntent(inbound);
+  if (intent === "unsubscribe") {
+    return {
+      subject: `Re: ${inbound.subject || "your message"}`,
+      text: [
+        "You’re unsubscribed from our emails. We won’t reach out again.",
+        "If this was a mistake, reply with “resubscribe.”"
+      ].join("\n"),
+      intent
+    };
+  }
+  const builder = TEMPLATES[intent] || TEMPLATES.fallback;
+  return {
+    subject: `Re: ${inbound.subject || "your message"}`,
+    text: builder(calendly),
+    intent
+  };
 }
 
 function findLatestInboundEmail(messages) {
@@ -198,10 +348,6 @@ app.post("/hubspot/webhook", async (req, res) => {
       return;
     }
 
-    console.log("Events:", events.map(e => ({
-      sub: e.subscriptionType, obj: e.objectId, id: e.eventId, when: e.occurredAt
-    })));
-
     for (const ev of events) {
       await handleHubSpotEvent(ev);
     }
@@ -214,7 +360,9 @@ async function handleHubSpotEvent(ev) {
   const sub = (ev.subscriptionType || "").toLowerCase();
   const threadId = ev.objectId;
   const eventId = ev.eventId || `${sub}:${threadId}:${ev.occurredAt}`;
-  console.log("HANDLE", { sub, threadId, eventId, AUTO_COMMENT: process.env.AUTO_COMMENT, AUTO_REPLY: process.env.AUTO_REPLY });
+
+  // Minimal, helpful logs
+  console.log("HANDLE", { sub, threadId });
 
   if (processedEventIds.has(eventId)) return;
   remember(processedEventIds, eventId, 5 * 60 * 1000);
@@ -224,86 +372,83 @@ async function handleHubSpotEvent(ev) {
     remember(commentedThreads, threadId, 60 * 60 * 1000);
     if (process.env.AUTO_COMMENT === "true") {
       try {
-        console.log("ACTION", { type: "COMMENT", threadId });
         await postThreadComment(threadId, "✅ Webhook OK — bot received the message.");
-        console.log("Comment posted on thread", threadId);
-      } catch (e) {
-        console.error("Failed to post comment:", e);
-      }
+      } catch {}
     }
     return;
   }
 
   if (sub !== "conversation.newmessage" || !threadId) return;
-  if (process.env.AUTO_REPLY !== "true") return;
 
-  await sleep(700); // give indexing time
+  // Optional review mode: only draft comments
+  const REVIEW_MODE = (process.env.REPLY_MODE || "auto").toLowerCase() === "review";
+
+  await sleep(700);
   let messages = [];
   try {
-    messages = await getRecentMessages(threadId, 25);
-  } catch (e) {
-    console.error("Failed to fetch messages:", e);
+    messages = await getRecentMessages(threadId, 20);
+  } catch {
     return;
   }
-
-  console.log("RECENTS", messages.map(m => ({
-    id: m.id || m.messageId,
-    t: m.type,
-    d: m.direction,
-    app: m.client?.integrationAppId,
-    ch: m.channelId,
-    acc: m.channelAccountId,
-    senders: (Array.isArray(m.senders) && m.senders.map(s => s.actorId)) || []
-  })));
 
   const inbound = findLatestInboundEmail(messages);
-  if (!inbound) {
-    console.log("No inbound MESSAGE found to reply to (skipping).");
-    return;
-  }
+  if (!inbound) return;
 
-  console.log("INBOUND", JSON.stringify(inbound, null, 2));
+  // Skip NDR/bounce
+  if (isBounce(inbound)) return;
 
   const channelId = inbound.channelId || messages.find(m => m.channelId)?.channelId;
   const channelAccountId = inbound.channelAccountId || messages.find(m => m.channelAccountId)?.channelAccountId;
 
   let senderActorId = process.env.SENDER_ACTOR_ID;
-  if (!senderActorId) {
-    senderActorId = findLatestAgentActorId(messages);
-    if (senderActorId) console.log("Derived senderActorId from previous OUTGOING:", senderActorId);
-  }
+  if (!senderActorId) senderActorId = findLatestAgentActorId(messages);
 
   const toEmail = await extractSenderEmail(inbound);
-  if (!channelId || !channelAccountId || !senderActorId || !toEmail) {
-    console.error("Missing required fields to send:", {
-      channelId, channelAccountId, senderActorId, toEmail
-    });
-    try {
-      await postThreadComment(threadId, "⚠️ Bot is connected but needs configuration: missing channel/account/sender or recipient email. See logs.");
-    } catch {}
-    return;
+  const calendly = process.env.CALENDLY_URL || "<YOUR-CALENDLY-LINK>";
+  const reply = makeReply(inbound, calendly);
+
+  // Tag the contact with intent (even in review mode)
+  if (toEmail && reply.intent !== "unsubscribe") {
+    tagIntentOnContact(toEmail, reply.intent).catch(() => {});
   }
 
   const ttlHours = Number(process.env.REPLY_TTL_HOURS || 12);
   if (repliedThreads.has(threadId)) return;
-  remember(repliedThreads, threadId, Math.max(1, ttlHours) * 60 * 60 * 1000);
 
-  const calendly = process.env.CALENDLY_URL || "<YOUR-CALENDLY-LINK>";
-  const text = [
-    `Thanks for reaching out — happy to help!`,
-    `Could you share a bit more detail (volume, timeline, and any specs)?`,
-    `If convenient, you can also grab a quick call: ${calendly}`,
-    ``,
-    `If you’d prefer not to hear from us, reply “unsubscribe.”`
-  ].join("\n");
-  const subject = "Re: your message";
+  if (reply.intent === "unsubscribe") {
+    try {
+      await postThreadComment(threadId, "🛑 Contact asked to unsubscribe. Bot did not reply.");
+    } catch {}
+    return;
+  }
 
-  try {
-    console.log("ACTION", { type: "MESSAGE", threadId, toEmail, senderActorId, channelId, channelAccountId });
-    await sendThreadMessage(threadId, { text, subject, toEmail, senderActorId, channelId, channelAccountId });
-    console.log("Auto-reply sent to thread", threadId, "to", toEmail);
-  } catch (e) {
-    console.error("Failed to send auto-reply:", e);
+  if (REVIEW_MODE) {
+    try {
+      await postThreadComment(threadId, `📝 Bot draft (${reply.intent}):\n\nSubject: ${reply.subject}\n\n${reply.text}`);
+      remember(repliedThreads, threadId, Math.max(1, ttlHours) * 60 * 60 * 1000);
+    } catch (e) {
+      console.error("Failed to post draft comment:", e?.message || e);
+    }
+    return;
+  }
+
+  if (process.env.AUTO_REPLY === "true") {
+    if (!channelId || !channelAccountId || !senderActorId || !toEmail) return;
+    try {
+      const resp = await sendThreadMessage(threadId, {
+        text: reply.text,
+        subject: reply.subject,
+        toEmail,
+        senderActorId,
+        channelId,
+        channelAccountId
+      });
+      console.log("ACTION", { type: "MESSAGE", threadId, intent: reply.intent });
+      if (resp?.status?.statusType) console.log("STATUS", resp.status.statusType);
+      remember(repliedThreads, threadId, Math.max(1, ttlHours) * 60 * 60 * 1000);
+    } catch (e) {
+      console.error("Failed to send auto-reply:", e?.message || e);
+    }
   }
 }
 
